@@ -40,6 +40,16 @@ extern "C"
 #include <assert.h>
 #include <math.h>
 #include <string>
+#include <list>
+#include <QList>
+#include <iostream>
+#include <fstream>
+#include <QDebug>
+#include <ctime>
+#include <QDateTime>
+#include <QFile>
+#include <QTextStream>
+#include <QThread>
 
 // compatibility with newer API
 #if LIBAVCODEC_VERSION_INT < AV_VERSION_INT(55,28,1)
@@ -75,6 +85,16 @@ typedef struct PacketQueue {
 	SDL_cond *cond;
 } PacketQueue;
 
+typedef struct Frame
+{
+	Frame::Frame()
+	{
+		avFrame = av_frame_alloc();
+	}
+	AVFrame *avFrame;
+	double pts;
+	int num;
+} Frame;
 
 typedef struct VideoPicture {
 	SDL_Texture *bmp;
@@ -123,6 +143,9 @@ typedef struct VideoState {
 	struct SwsContext *sws_ctx;
 
 	VideoPicture    pictq[VIDEO_PICTURE_QUEUE_SIZE];
+	//Frame			disFrame;
+	//std::list<Frame> listFrame;
+	
 	int             pictq_size, pictq_rindex, pictq_windex;
 	SDL_mutex       *pictq_mutex;
 	SDL_cond        *pictq_cond;
@@ -142,9 +165,20 @@ enum {
 
 SDL_Window  *screen;
 SDL_Renderer *renderer;
+SDL_Texture *texture;
+SDL_Rect showrect;
 SDL_mutex   *screen_mutex;
+SDL_mutex   *frame_mutex;
+QList<Frame>    listFrame;
+Frame			disFrame;
+AVFrame *showFrame;
 unsigned char *out_buffer;
 std::string url;
+int eof;
+int num_putin_list = 0;
+std::fstream f;
+int num_decoded = 0;
+QTime qtime;
 
 /* Since we only have one decoding thread, the Big Struct
 can be global in case we need it. */
@@ -349,8 +383,10 @@ int audio_decode_frame(VideoState *is, uint8_t *audio_buf, int buf_size, double 
 	double pts;
 	int n;
 
-	for (;;) {
-		while (is->audio_pkt_size > 0) {
+	for (;;) 
+	{
+		while (is->audio_pkt_size > 0) 
+		{
 			int got_frame = 0;
 			len1 = avcodec_decode_audio4(is->audio_ctx, &is->audio_frame, &got_frame, pkt);//len1指的是我们一次使用的大小，即一帧的大小
 			if (len1 < 0) {
@@ -448,6 +484,32 @@ static Uint32 sdl_refresh_timer_cb(Uint32 interval, void *opaque) {
 /* schedule a video refresh in 'delay' ms */
 static void schedule_refresh(VideoState *is, int delay) {
 	SDL_AddTimer(delay, sdl_refresh_timer_cb, is);
+	//f << "current time: " << av_gettime()/1000000 << "\n";
+}
+
+void display_frame(VideoState *is)
+{
+	AVFrame *frame = av_frame_alloc();
+	av_frame_ref(frame, disFrame.avFrame);
+	f << "num to display: " << disFrame.num << "---pts: "<< disFrame.pts << "own pts: " << frame->pts<<"---current time: "<< av_gettime()/1000 << "\n";
+	sws_scale(is->sws_ctx, (uint8_t const* const*)frame->data,
+		frame->linesize, 0, is->video_ctx->height, showFrame->data, showFrame->linesize);
+	if (frame->linesize[0] >0 && frame->linesize[1] > 0 && frame->linesize[2] >0)
+	{
+		SDL_UpdateYUVTexture(texture, NULL, frame->data[0], frame->linesize[0],
+			frame->data[1], frame->linesize[1],
+			frame->data[2], frame->linesize[2]);
+	}
+	else if (frame->linesize[0] < 0 && frame->linesize[1] < 0 && frame->linesize[2] < 0) {
+		SDL_UpdateYUVTexture(texture, NULL, frame->data[0] + frame->linesize[0] * (frame->height - 1), -frame->linesize[0],
+			frame->data[1] + frame->linesize[1] * (AV_CEIL_RSHIFT(frame->height, 1) - 1), -frame->linesize[1],
+			frame->data[2] + frame->linesize[2] * (AV_CEIL_RSHIFT(frame->height, 1) - 1), -frame->linesize[2]);
+	}
+	//SDL_UpdateTexture(texture, &showrect, frame->data[0], frame->linesize[0]);
+	SDL_RenderClear(renderer);
+	SDL_RenderCopy(renderer, texture, NULL, &showrect);
+	SDL_RenderPresent(renderer);
+	av_frame_unref(frame);
 }
 
 void video_display(VideoState *is) {
@@ -494,11 +556,27 @@ void video_display(VideoState *is) {
 #endif
 		SDL_LockMutex(screen_mutex);
 		SDL_RenderClear(renderer);
-		SDL_RenderCopy(renderer, vp->bmp, &rect, &rect);
+		SDL_RenderCopy(renderer, vp->bmp, NULL, NULL);
 		SDL_RenderPresent(renderer);
 	}
 }
 
+void list_frame_get(VideoState *is, Frame &pFrame)
+{
+	if (listFrame.isEmpty())
+	{
+		return;
+	}
+	SDL_LockMutex(frame_mutex);
+	pFrame.avFrame = listFrame.front().avFrame;
+	pFrame.pts = listFrame.front().pts;
+	pFrame.num = listFrame.front().num;
+	listFrame.pop_front();
+	f << "get frame pts: " << pFrame.pts << "frame num: " << pFrame.num	<< "\n";
+	SDL_UnlockMutex(frame_mutex);
+}
+
+//video 刷新计时器
 void video_refresh_timer(void *userdata) {
 
 	VideoState *is = (VideoState *)userdata;
@@ -506,29 +584,40 @@ void video_refresh_timer(void *userdata) {
 	double actual_delay, delay, sync_threshold, ref_clock, diff;
 
 	if (is->video_st) {
-		if (is->pictq_size == 0) {
+		//if (is->pictq_size == 0) 
+		if (listFrame.size() == 0)
+		{
+			//av_usleep(1000);
 			schedule_refresh(is, 1);
+			QDateTime time = QDateTime::currentDateTime();
+			QString strtime = time.toString("dd.MM.yyyy hh:mm:ss.zzz");
+			std::string stdtime = strtime.toStdString();
+			f << "start play: " << stdtime << "\n";
 		}
 		else {
-			vp = &is->pictq[is->pictq_rindex];
+			//vp = &is->pictq[is->pictq_rindex];
+			list_frame_get(is, disFrame);
+			//is->video_current_pts = vp->pts;
+			is->video_current_pts = disFrame.pts;
 
-			is->video_current_pts = vp->pts;
 			is->video_current_pts_time = av_gettime();
-			delay = vp->pts - is->frame_last_pts; /* the pts from last time */
+			//delay = vp->pts - is->frame_last_pts; /* the pts from last time */
+			delay = disFrame.pts - is->frame_last_pts;
 			if (delay <= 0 || delay >= 1.0) {
 				/* if incorrect delay, use previous one */
 				delay = is->frame_last_delay;
 			}
 			/* save for next time */
 			is->frame_last_delay = delay;
-			is->frame_last_pts = vp->pts;
-
+			//is->frame_last_pts = vp->pts;
+			is->frame_last_pts = disFrame.pts;
 
 
 			/* update delay to sync to audio if not master source */
 			if (is->av_sync_type != AV_SYNC_VIDEO_MASTER) {
 				ref_clock = get_master_clock(is);
-				diff = vp->pts - ref_clock;
+				//diff = vp->pts - ref_clock;
+				diff = disFrame.pts - ref_clock;
 
 				/* Skip or repeat the frame. Take delay into account
 				FFPlay still doesn't "know if this is the best guess." */
@@ -545,23 +634,28 @@ void video_refresh_timer(void *userdata) {
 			is->frame_timer += delay;
 			/* computer the REAL delay */
 			actual_delay = is->frame_timer - (av_gettime() / 1000000.0);
+
 			if (actual_delay < 0.010) {
 				/* Really it should skip the picture instead */
 				actual_delay = 0.010;
 			}
-			schedule_refresh(is, (int)(actual_delay * 1000 + 0.5));
 
+			//f << "actual_delay: " << actual_delay << "\n";
+			//av_usleep(actual_delay * 1000000);
+			schedule_refresh(is, (int)(actual_delay * 1000 + 0.5));
+		
 			/* show the picture! */
-			video_display(is);
+			display_frame(is);
+			//video_display(is);
 
 			/* update queue for next picture! */
-			if (++is->pictq_rindex == VIDEO_PICTURE_QUEUE_SIZE) {
+			/*if (++is->pictq_rindex == VIDEO_PICTURE_QUEUE_SIZE) {
 				is->pictq_rindex = 0;
 			}
 			SDL_LockMutex(is->pictq_mutex);
 			is->pictq_size--;
 			SDL_CondSignal(is->pictq_cond);
-			SDL_UnlockMutex(is->pictq_mutex);
+			SDL_UnlockMutex(is->pictq_mutex);*/
 		}
 	}
 	else {
@@ -594,12 +688,20 @@ void alloc_picture(void *userdata) {
 	vp->allocated = 1;
 }
 
-/*
-将frame转化为SDL可用的格式，然后以SDL_Texture的形式保存在队列中
-*/
+void list_frame_put(VideoState *is, AVFrame *pFrame, double pts)
+{
+	SDL_LockMutex(frame_mutex);
+	Frame frame;
+	av_frame_ref(frame.avFrame, pFrame);
+	//frame.avFrame = pFrame;
+	frame.pts = pts;
+	frame.num = num_putin_list++;
+	listFrame.push_back(frame);
+	SDL_UnlockMutex(frame_mutex);
+}
+
 int queue_picture(VideoState *is, AVFrame *pFrame, double pts) 
 {
-
 	VideoPicture *vp;
 	int dst_pix_fmt;
 	//use AVFrame instead
@@ -635,8 +737,8 @@ int queue_picture(VideoState *is, AVFrame *pFrame, double pts)
 	}
 	/* We have a place to put our picture on the queue */
 	//out_buffer = (unsigned char *)av_malloc(av_image_get_buffer_size(AV_PIX_FMT_YUV420P, is->video_ctx->width, is->video_ctx->height, 1));
-	av_image_fill_arrays(pict->data, pict->linesize, out_buffer,
-		AV_PIX_FMT_YUV420P, is->video_ctx->width, is->video_ctx->height, 1);
+	/*av_image_fill_arrays(pict->data, pict->linesize, out_buffer,
+		AV_PIX_FMT_YUV420P, is->video_ctx->width, is->video_ctx->height, 1);*/
 
 
 	if (vp->bmp) {
@@ -664,10 +766,19 @@ int queue_picture(VideoState *is, AVFrame *pFrame, double pts)
 			pFrame->linesize, 0, is->video_ctx->height,
 			pict.data, pict.linesize);
 #endif
-		sws_scale(is->sws_ctx, (const unsigned char* const*)pFrame->data,
+		sws_scale(is->sws_ctx, (uint8_t const* const*)pFrame->data,
 			pFrame->linesize, 0, is->video_ctx->height, pict->data, pict->linesize);
 
-		SDL_UpdateTexture(vp->bmp, NULL, pict->data[0], pict->linesize[0]);
+		//SDL_UpdateTexture(vp->bmp, NULL, pict->data[0], pict->linesize[0]);
+		/*
+		在这里直接播放可以显示正常,速度不对
+		应将AVFrame存入队列中，待到要播放时，取出播放
+		*/
+		/*SDL_RenderClear(renderer);
+		SDL_RenderCopy(renderer, vp->bmp, NULL, NULL);
+		SDL_RenderPresent(renderer);*/
+
+
 		SDL_UnlockTexture(vp->bmp);
 		/* now we inform our display thread that we have a pic ready */
 		if (++is->pictq_windex == VIDEO_PICTURE_QUEUE_SIZE) {
@@ -708,12 +819,21 @@ int video_thread(void *arg) {
 	int frameFinished;
 	AVFrame *pFrame;
 	double pts;
+	AVRational tb = is->video_st->time_base;
+
+	texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_IYUV, SDL_TEXTUREACCESS_STREAMING,
+		is->video_ctx->width, is->video_ctx->height);
+	showrect.x = 0;
+	showrect.y = 0;
+	showrect.w = is->video_ctx->width;
+	showrect.h = is->video_ctx->height;
 
 	pFrame = av_frame_alloc();
 
 	for (;;) {
 		if (packet_queue_get(&is->videoq, packet, 1) < 0) {
 			// means we quit getting packets
+			//f << "End of File:" << av_gettime() <<"\n";
 			break;
 		}
 		// if(packet_queue_get(&is->videoq, packet, 1) < 0) {
@@ -730,29 +850,39 @@ int video_thread(void *arg) {
 		ret = avcodec_send_packet(is->video_ctx, packet);
 		if (ret < 0)
 		{
-			return -1;
+			continue;
 		}
 		avcodec_receive_frame(is->video_ctx, pFrame);
 		if (ret < 0)
 		{
-			return -1;
+			continue;
 		}
 
-		if ((pts = av_frame_get_best_effort_timestamp(pFrame)) == AV_NOPTS_VALUE) {
+		/*if ((pts = av_frame_get_best_effort_timestamp(pFrame)) == AV_NOPTS_VALUE) {
 			pts = av_frame_get_best_effort_timestamp(pFrame);
 		}
 		else {
 			pts = 0;
-		}
-		pts *= av_q2d(is->video_st->time_base);
+		}*/
 
+		//pts = (pFrame->pts == AV_NOPTS_VALUE) ? 0 : pFrame->pts * av_q2d(tb);
+		pFrame->pts = pFrame->best_effort_timestamp;
+		pts = av_q2d(is->video_st->time_base) * pFrame->pts;
+		
+		//pts *= av_q2d(is->video_st->time_base);
+		pts = synchronize_video(is, pFrame, pts);
+		f << "oripts: " << pFrame->pts << "---convert pts: " << pts << "\n";
+		list_frame_put(is, pFrame, pts);
+		f << "list of frame: " << listFrame.size() << "\n";
 		// Did we get a video frame?
+#if 0
 		if (frameFinished) {
 			pts = synchronize_video(is, pFrame, pts);
 			if (queue_picture(is, pFrame, pts) < 0) {
 				break;
 			}
 		}
+#endif
 		av_free_packet(packet);
 	}
 	av_frame_free(&pFrame);
@@ -824,15 +954,16 @@ int stream_component_open(VideoState *is, int stream_index) {
 		is->frame_last_delay = 40e-3;
 		is->video_current_pts_time = av_gettime();
 
-		out_buffer = (unsigned char *)av_malloc(av_image_get_buffer_size(AV_PIX_FMT_YUV420P, is->video_ctx->width, is->video_ctx->height, 1));
+		/*out_buffer = (unsigned char *)av_malloc(av_image_get_buffer_size(AV_PIX_FMT_YUV420P, is->video_ctx->width, is->video_ctx->height, 1));
+		av_image_fill_arrays(showFrame->data, showFrame->linesize, out_buffer,
+			AV_PIX_FMT_YUV420P, is->video_ctx->width, is->video_ctx->height, 1);*/
 
 		packet_queue_init(&is->videoq);
 		is->video_tid = SDL_CreateThread(video_thread, "video_thread", is);
 		is->sws_ctx = sws_getContext(is->video_ctx->width, is->video_ctx->height,
 			is->video_ctx->pix_fmt, is->video_ctx->width,
 			is->video_ctx->height, AV_PIX_FMT_YUV420P,
-			SWS_BICUBIC, NULL, NULL, NULL
-		);
+			SWS_BICUBIC, NULL, NULL, NULL);
 		break;
 	default:
 		break;
@@ -842,7 +973,7 @@ int stream_component_open(VideoState *is, int stream_index) {
 int decode_thread(void *arg) {
 
 	VideoState *is = (VideoState *)arg;
-	AVFormatContext *pFormatCtx;
+	AVFormatContext *pFormatCtx = NULL;
 	AVPacket pkt1, *packet = &pkt1;
 
 	int video_index = -1;
@@ -893,8 +1024,12 @@ int decode_thread(void *arg) {
 	}
 #endif
 
-	// main decode loop
+	QFile fileatp("D:/EricWork/SimplePlayer/x64/Debug/fps.txt");
+	if (!fileatp.open(QIODevice::WriteOnly | QIODevice::Text))
+		return -1;
+	QTextStream atp(&fileatp);
 
+	// main decode loop
 	for (;;) {
 		if (is->quit) {
 			break;
@@ -941,13 +1076,32 @@ int decode_thread(void *arg) {
 				SDL_Delay(100); /* no error; wait for user input */
 				continue;
 			}
+			if (is->pFormatCtx->pb->error == AVERROR_EOF)
+			{
+				eof = 1;
+			}
 			else {
 				break;
 			}
 		}
+
+		
+
 		// Is this a packet from the video stream?
 		if (packet->stream_index == is->videoStream) {
 			packet_queue_put(&is->videoq, packet);
+
+			if (num_decoded++ == 50)
+			{
+				num_decoded = 0;
+				QTime temp = QTime::currentTime();
+				double s = qtime.msecsTo(temp);
+				if (s != 0)
+				{
+					double fps = double(50 * 1000 / s);
+				}
+				qtime = temp;
+			}
 		}
 		else if (packet->stream_index == is->audioStream) {
 			packet_queue_put(&is->audioq, packet);
@@ -982,12 +1136,22 @@ void stream_seek(VideoState *is, int64_t pos, int rel) {
 
 int main(int argc, char *argv[]) {
 
+	f.open("D:/EricWork/SimplePlayer/x64/Debug/myfile.txt");
+	if (!f.is_open())
+	{
+		int x = 1;
+	}
 	SDL_Event       event;
-
+	frame_mutex = SDL_CreateMutex();
 	VideoState      *is;
-	url = "D:\\learnproject\\videoSource\\out.mp4";
+	//url = "D:\\learnproject\\videoSource\\muxvideo.mp4";
+	url = "D:\\learnproject\\videoSource\\cuc_ieschool.mp4";
+	//url = "rtmp://live.hkstv.hk.lxdns.com/live/hks";
+	//url = "rtmp://pili-live-rtmp.train.bjlxhz.com/lx-train/360051600_5a4db35fe929a80fadbc643d_1";
+	//url = "rtmp://pili-live-rtmp.train.bjlxhz.com/lx-train/420020340_5aba8df5a9071447d9310b88_2";
 	is = (VideoState *)av_mallocz(sizeof(VideoState));
-	
+	showFrame = av_frame_alloc();
+
 	// Register all formats and codecs
 	av_register_all();
 
@@ -996,8 +1160,9 @@ int main(int argc, char *argv[]) {
 		exit(1);
 	}
 
+	//f << "play start:" << av_gettime() << "\n";
 	// Make a screen to put our video
-	screen = SDL_CreateWindow("", 0, 0, 640, 480, SDL_WINDOW_OPENGL);
+	screen = SDL_CreateWindow("", 0, 0, 320, 240, SDL_WINDOW_OPENGL);
 	renderer = SDL_CreateRenderer(screen, -1, 0);
 
 	if (!screen) {
@@ -1014,6 +1179,10 @@ int main(int argc, char *argv[]) {
 	is->pictq_mutex = SDL_CreateMutex();
 	is->pictq_cond = SDL_CreateCond();
 
+	QDateTime time = QDateTime::currentDateTime();
+	QString strtime = time.toString("dd.MM.yyyy hh:mm:ss.zzz");
+	std::string stdtime = strtime.toStdString();
+	f << "start play: " << stdtime << "\n";
 	schedule_refresh(is, 40);
 
 	is->av_sync_type = DEFAULT_AV_SYNC_TYPE;
@@ -1028,6 +1197,7 @@ int main(int argc, char *argv[]) {
 
 	for (;;) {
 		double incr, pos;
+		//refresh_loop_wait_event(is, &event);
 		SDL_WaitEvent(&event);
 		switch (event.type) {
 		case SDL_KEYDOWN:
